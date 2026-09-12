@@ -29,11 +29,38 @@ class SessionContextMixin:
         """``_guarded`` around ``_authed_call(label, fn)`` (401 -> forced refresh + one retry)."""
         return self._guarded(lambda: self._authed_call(label, fn), default, level, msg, *args)
 
+    def _resolved_session(self, session_key: str) -> Any:
+        """Session for a READ path, self-healing a key this manager has not cached yet.
+
+        Reads can arrive before the local ``_cache`` is warm — a fresh manager after a restart
+        or client rebuild, a tool call racing session init — while Honcho already holds the
+        session. Without this, every read path silently reports "no memory" for data that
+        exists. ``get_or_create`` is idempotent (it returns the existing Honcho session, and
+        creates one only when genuinely absent) and never calls back into the read paths, so
+        resolving through it cannot recurse.
+
+        May propagate HonchoAuthError from the resolver; callers with a fail-open contract
+        (``get_prefetch_context``) catch it.
+        """
+        session = self._cache.get(session_key)
+        if session is not None:
+            return session
+        logger.debug("Local session cache miss for '%s'; resolving via get_or_create", session_key)
+        return self.get_or_create(session_key)
+
     def _guarded_session(
         self, session_key: str, fn: Callable[[Any], Any], default: Any, level: int, msg: str, *args: Any,
+        heal: bool = False,
     ) -> Any:
-        """``_guarded`` over ``fn(session)`` for the cached session; ``default`` when no session is cached."""
-        session = self._cache.get(session_key)
+        """``_guarded`` over ``fn(session)`` for the cached session; ``default`` when no session is cached.
+
+        Read operations pass ``heal=True`` to resolve an uncached key via ``_resolved_session``
+        first; writes keep the no-session no-op so a mutation never conjures a session.
+        HonchoAuthError from either step still propagates (the read contract).
+        """
+        session = (self._guarded(lambda: self._resolved_session(session_key), None, level,
+                                 "Failed to resolve Honcho session '%s': %s", session_key)
+                   if heal else self._cache.get(session_key))
         return self._guarded(lambda: fn(session), default, level, msg, *args) if session else default
 
     @staticmethod
@@ -94,9 +121,14 @@ class SessionContextMixin:
     ) -> dict[str, str]:
         """Pre-fetch user + AI peer context (representation, card) plus the session summary.
         ``user_message`` is passed as search_query so Honcho returns topic-relevant conclusions.
-        Stops early (returning what it has) once auth is dead."""
-        session = self._cache.get(session_key)
-        if not session:
+        Stops early (returning what it has) once auth is dead. An uncached session key is resolved
+        via ``get_or_create``; a resolution failure stays fail-open and returns {}."""
+        try:
+            session = self._resolved_session(session_key)
+        except HonchoAuthError:
+            return {}  # _authed_call already recorded it; the notice path reports the reason.
+        except Exception as e:
+            logger.debug("Failed to resolve session '%s' for prefetch: %s", session_key, e)
             return {}
         result: dict[str, str] = {}
 
@@ -147,10 +179,9 @@ class SessionContextMixin:
 
     def get_session_context(self, session_key: str, peer: str = "user") -> dict[str, Any]:
         """Fetch session-level context (summary, representation, card, recent messages).
-        Raises HonchoAuthError so callers can tell rejected credentials from no context."""
-        session = self._cache.get(session_key)
-        if not session:
-            return {}
+        Raises HonchoAuthError so callers can tell rejected credentials from no context.
+        An uncached session key is resolved via ``get_or_create`` rather than read as empty."""
+        session = self._resolved_session(session_key)
         if session.honcho_session_id not in self._sessions_cache:
             # Fall back to peer-level context, respecting the requested peer.
             peer_id = self._resolve_peer_id(session, peer)
@@ -186,16 +217,20 @@ class SessionContextMixin:
             card = self._fetch_peer_card(observer_peer_id, target=target_peer_id)
             # Some backends store cards on the target peer, not the observer-target slot.
             return card or (self._fetch_peer_card(target_peer_id) if target_peer_id else [])
-        return self._guarded_session(session_key, _fetch, [], logging.DEBUG, "Failed to fetch peer card from Honcho: %s")
+        return self._guarded_session(
+            session_key, _fetch, [], logging.DEBUG, "Failed to fetch peer card from Honcho: %s", heal=True,
+        )
 
     def search_context(self, session_key: str, query: str, max_tokens: int = 800, peer: str = "user") -> str:
         """Hybrid search over raw messages visible from ``peer``'s perspective, all sessions. Snippets
         accumulate until ``max_tokens`` (~4 chars/token) is exhausted. Returns "" when nothing matches;
-        raises HonchoAuthError on rejected credentials."""
-        session = self._cache.get(session_key)
+        raises HonchoAuthError on rejected credentials. A session key this manager has not cached
+        yet is resolved through ``get_or_create`` so a cold-cache search still queries instead of
+        silently reporting no matches."""
         q = (query or "").strip()[:4000]  # Honcho caps query length for the embedding model.
-        if not session or not q:
+        if not q:
             return ""
+        session = self._resolved_session(session_key)
         peer_id = self._resolve_peer_id(session, peer)
         char_budget = max(200, int(max_tokens) * 4)
         limit = max(3, min(20, char_budget // 300))
@@ -284,7 +319,7 @@ class SessionContextMixin:
                 scope = self._conclusions_scope(session, target_peer_id)
                 return scope.query(query, top_k=limit) if query else scope.list(size=limit).items
             return [{"id": c.id, "content": c.content} for c in self._authed_call("conclusion list", _fetch)]
-        return self._guarded_session(session_key, _list, [], logging.DEBUG, "Honcho list_conclusions failed: %s")
+        return self._guarded_session(session_key, _list, [], logging.DEBUG, "Honcho list_conclusions failed: %s", heal=True)
 
     def set_peer_card(self, session_key: str, card: list[str], peer: str = "user") -> list[str] | None:
         """Replace a peer's card. Returns the updated card, or None on failure."""
@@ -335,7 +370,7 @@ class SessionContextMixin:
             return {"representation": rep, "card": card}
         return self._guarded_session(
             session_key, _fetch, {"representation": "", "card": ""}, logging.DEBUG,
-            "Failed to fetch AI representation: %s",
+            "Failed to fetch AI representation: %s", heal=True,
         )
 
     def dialectic_query(
@@ -357,7 +392,7 @@ class SessionContextMixin:
         server error surfaces as an error, not as "no result" (#36098 issue 4: collapsing failures to ""
         made auth errors, timeouts, and genuinely-empty answers indistinguishable).
         """
-        session = self._cache.get(session_key)
+        session = self._resolved_session(session_key)
         target_peer_id = self._resolve_peer_id(session, peer) if session else None
         if target_peer_id is None:
             return ""

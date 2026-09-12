@@ -110,6 +110,130 @@ class TestPeerLookupHelpers:
         # user-stated facts from assistant-derived ones.
         assert "[assistant" in result
 
+    def test_search_context_resolves_session_missing_from_local_cache(self):
+        """An uncached key must self-heal through get_or_create before searching.
+
+        Read paths run on managers whose local ``_cache`` is still cold (fresh manager
+        after a restart or a client rebuild, tool calls racing session init) even though
+        Honcho already holds the session. Returning "" there reports "no relevant
+        context" for data that exists, so search must resolve the key through the
+        manager's idempotent get_or_create path and then run the normal query.
+        """
+        mgr = HonchoSessionManager()
+        session = HonchoSession(
+            key="telegram:123",
+            user_peer_id="robert",
+            assistant_peer_id="hermes",
+            honcho_session_id="telegram-123",
+        )
+        # Deliberately NOT cached: this is the fresh/cold-manager state.
+        assert mgr._cache == {}
+        resolver = MagicMock(return_value=session)
+        mgr.get_or_create = resolver
+
+        honcho_client = MagicMock()
+        honcho_client.search.return_value = [
+            SimpleNamespace(content="Robert runs neuralancer", peer_id="robert", session_id="s-old", id="m1"),
+        ]
+        with patch.object(HonchoSessionManager, "honcho", new_callable=lambda: property(lambda s: honcho_client)):
+            result = mgr.search_context(session.key, "neuralancer")
+
+        # The session key was resolved through the idempotent get-or-create path...
+        resolver.assert_called_once_with(session.key)
+        # ...and the real search result came back instead of a silent "".
+        assert result != ""
+        assert "Robert runs neuralancer" in result
+        _args, kwargs = honcho_client.search.call_args
+        assert kwargs["filters"] == {"peer_perspective": session.user_peer_id}
+
+    def test_search_context_cold_cache_resolves_through_real_get_or_create(self):
+        """End-to-end: a cold manager resolves the session for real, then searches.
+
+        Uses the real ``get_or_create`` (not a stub) against a fake Honcho client so the
+        test also proves the resolver never re-enters ``search_context`` (that would
+        recurse) and that the search still runs against the resolved session.
+        """
+        class _FakeSDKSession:
+            def add_peers(self, entries):
+                pass
+
+            def get_peer_configuration(self, peer):
+                return SimpleNamespace(observe_me=None, observe_others=None)
+
+            def context(self, **kwargs):
+                return SimpleNamespace(messages=[], summary=None)
+
+        honcho_client = MagicMock()
+        honcho_client.session.return_value = _FakeSDKSession()
+        honcho_client.search.return_value = [
+            SimpleNamespace(content="cold cache hit", peer_id="user-telegram-123", session_id="s1", id="m1"),
+        ]
+        mgr = HonchoSessionManager()
+        assert mgr._cache == {}
+        with patch.object(HonchoSessionManager, "honcho", new_callable=lambda: property(lambda s: honcho_client)):
+            result = mgr.search_context("telegram:123", "cold")
+
+        assert "cold cache hit" in result
+        # get_or_create cached the resolved session for later reads.
+        assert mgr._cache["telegram:123"].honcho_session_id == "telegram-123"
+        assert honcho_client.search.call_count == 1
+
+    def test_get_peer_card_cold_cache_resolves_session(self):
+        """Read: a peer card must be fetched for an uncached key, not read as absent."""
+        mgr = HonchoSessionManager()
+        session = HonchoSession(key="k", user_peer_id="robert", assistant_peer_id="hermes", honcho_session_id="s")
+        resolver = MagicMock(return_value=session)
+        mgr.get_or_create = resolver
+        peer = MagicMock()
+        peer.get_card.return_value = ["knows Python"]
+        mgr._get_or_create_peer = MagicMock(return_value=peer)
+
+        assert mgr.get_peer_card("k") == ["knows Python"]
+        resolver.assert_called_once_with("k")
+
+    def test_list_conclusions_cold_cache_resolves_session(self):
+        """Read: conclusions must be listed for an uncached key, not read as empty."""
+        mgr = HonchoSessionManager()
+        session = HonchoSession(key="k", user_peer_id="robert", assistant_peer_id="hermes", honcho_session_id="s")
+        mgr.get_or_create = MagicMock(return_value=session)
+        observer = MagicMock()
+        observer.conclusions_of.return_value.list.return_value = SimpleNamespace(
+            items=[SimpleNamespace(id="c1", content="likes tea")],
+        )
+        mgr._get_or_create_peer = MagicMock(return_value=observer)
+
+        assert mgr.list_conclusions("k") == [{"id": "c1", "content": "likes tea"}]
+        mgr.get_or_create.assert_called_once_with("k")
+
+    def test_get_session_context_cold_cache_resolves_session(self):
+        """Read: session context must resolve an uncached key instead of returning {}."""
+        mgr = HonchoSessionManager()
+        session = HonchoSession(key="k", user_peer_id="robert", assistant_peer_id="hermes", honcho_session_id="s")
+        mgr.get_or_create = MagicMock(return_value=session)
+        mgr._fetch_peer_context = MagicMock(return_value={"representation": "rep", "card": []})
+
+        assert mgr.get_session_context("k")["representation"] == "rep"
+        mgr.get_or_create.assert_called_once_with("k")
+
+    def test_prefetch_context_cold_cache_resolves_session(self):
+        """Read: prefetch must resolve an uncached key instead of returning {}."""
+        mgr = HonchoSessionManager()
+        session = HonchoSession(key="k", user_peer_id="robert", assistant_peer_id="hermes", honcho_session_id="s")
+        mgr.get_or_create = MagicMock(return_value=session)
+        mgr._fetch_peer_context = MagicMock(return_value={"representation": "rep", "card": ["fact"]})
+
+        result = mgr.get_prefetch_context("k")
+
+        assert result["representation"] == "rep"
+        mgr.get_or_create.assert_called_once_with("k")
+
+    def test_create_conclusion_still_no_ops_without_cached_session(self):
+        """Write: a missing local session must stay a no-op, not conjure one."""
+        mgr = HonchoSessionManager()
+        mgr.get_or_create = MagicMock()
+
+        assert mgr.create_conclusion("k", "some fact") is False
+        mgr.get_or_create.assert_not_called()
 
     def test_create_conclusion_defaults_to_user_target(self):
         mgr, session = self._make_cached_manager()
